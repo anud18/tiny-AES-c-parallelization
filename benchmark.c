@@ -9,6 +9,7 @@
 #define ECB 1
 #include "aes.h"
 #include "aes_openmp.h"
+#include "aes_openmp_false_sharing.h"
 
 // CSV output file handle
 static FILE* csv_file = NULL;
@@ -38,11 +39,12 @@ static int test_correctness()
     const size_t test_size = 1024 * 1024; // 1 MB
     uint8_t* data_seq = (uint8_t*)malloc(test_size);
     uint8_t* data_par = (uint8_t*)malloc(test_size);
+    uint8_t* data_par_fs = (uint8_t*)malloc(test_size);
 
     // Initialize with random data
     for (size_t i = 0; i < test_size; ++i)
     {
-        data_seq[i] = data_par[i] = rand() & 0xFF;
+        data_seq[i] = data_par[i] = data_par_fs[i] = rand() & 0xFF;
     }
 
     // Setup AES context
@@ -56,17 +58,21 @@ static int test_correctness()
         0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff
     };
 
-    struct AES_ctx ctx_seq, ctx_par;
+    struct AES_ctx ctx_seq, ctx_par, ctx_par_fs;
     AES_init_ctx_iv(&ctx_seq, key, iv);
     AES_init_ctx_iv(&ctx_par, key, iv);
+    AES_init_ctx_iv(&ctx_par_fs, key, iv);
 
     // Encrypt with sequential version
     AES_CTR_xcrypt_buffer(&ctx_seq, data_seq, test_size);
 
-    // Encrypt with parallel version (with copy)
+    // Encrypt with parallel version (optimized)
     AES_CTR_xcrypt_buffer_openmp(&ctx_par, data_par, test_size);
 
-    // Compare sequential vs parallel (with copy)
+    // Encrypt with parallel version (false sharing)
+    AES_CTR_xcrypt_buffer_openmp_false_sharing(&ctx_par_fs, data_par_fs, test_size);
+
+    // Compare sequential vs parallel (optimized)
     int errors_par = 0;
     for (size_t i = 0; i < test_size; ++i)
     {
@@ -81,18 +87,44 @@ static int test_correctness()
         }
     }
 
+    // Compare sequential vs parallel (false sharing)
+    int errors_par_fs = 0;
+    for (size_t i = 0; i < test_size; ++i)
+    {
+        if (data_seq[i] != data_par_fs[i])
+        {
+            if (errors_par_fs < 10)
+            {
+                printf("Error (PAR_FS vs SEQ) at byte %zu: seq=0x%02x, par_fs=0x%02x\n",
+                       i, data_seq[i], data_par_fs[i]);
+            }
+            errors_par_fs++;
+        }
+    }
+
     free(data_seq);
     free(data_par);
+    free(data_par_fs);
 
     int all_passed = 1;
 
     if (errors_par == 0)
     {
-        printf("✓ OpenMP vs Sequential:  PASSED\n");
+        printf("✓ OpenMP (optimized) vs Sequential:     PASSED\n");
     }
     else
     {
-        printf("✗ OpenMP vs Sequential:  FAILED - Found %d mismatches\n", errors_par);
+        printf("✗ OpenMP (optimized) vs Sequential:     FAILED - Found %d mismatches\n", errors_par);
+        all_passed = 0;
+    }
+
+    if (errors_par_fs == 0)
+    {
+        printf("✓ OpenMP (false sharing) vs Sequential: PASSED\n");
+    }
+    else
+    {
+        printf("✗ OpenMP (false sharing) vs Sequential: FAILED - Found %d mismatches\n", errors_par_fs);
         all_passed = 0;
     }
 
@@ -153,15 +185,17 @@ static void benchmark_size(size_t size_mb)
         fprintf(csv_file, "%zu,Sequential,1,%lf,%lf\n", size_mb, throughput_seq, avg_time_seq);
     }
 
-    // Benchmark parallel version with different thread counts
+    // Benchmark parallel version (OPTIMIZED) with different thread counts
     int max_threads = omp_get_max_threads();
     printf("\nMaximum available threads: %d\n\n", max_threads);
 
     int thread_counts[] = {1, 2, 4, 8, 16};
     int num_tests = sizeof(thread_counts) / sizeof(thread_counts[0]);
 
-    double time_1thread = 0.0;
+    double time_1thread_opt = 0.0;
+    double time_1thread_fs = 0.0;
 
+    printf("--- OPTIMIZED (no false sharing) ---\n");
     for (int t = 0; t < num_tests; ++t)
     {
         int num_threads = thread_counts[t];
@@ -186,19 +220,19 @@ static void benchmark_size(size_t size_mb)
         double throughput_par = (size / (1024.0 * 1024.0)) / avg_time_par;
 
         char thread_label[64];
-        snprintf(thread_label, sizeof(thread_label), "OpenMP (%d thread%s)",
+        snprintf(thread_label, sizeof(thread_label), "OpenMP-Opt (%d thread%s)",
                  num_threads, num_threads > 1 ? "s" : "");
         print_throughput(thread_label, size, avg_time_par);
 
         // Write parallel result to CSV
         if (csv_file)
         {
-            fprintf(csv_file, "%zu,OpenMP,%d,%lf,%lf\n", size_mb, num_threads, throughput_par, avg_time_par);
+            fprintf(csv_file, "%zu,OpenMP-Optimized,%d,%lf,%lf\n", size_mb, num_threads, throughput_par, avg_time_par);
         }
 
         if (num_threads == 1)
         {
-            time_1thread = avg_time_par;
+            time_1thread_opt = avg_time_par;
             printf("  Sequential version");
             printf("            : %10.3f MB/s  (%.3f seconds for %.2f MB)\n",
                    throughput_seq, avg_time_seq,
@@ -207,7 +241,57 @@ static void benchmark_size(size_t size_mb)
         }
         else
         {
-            printf("  Speedup vs 1 thread        : %.2fx\n", time_1thread / avg_time_par);
+            printf("  Speedup vs 1 thread        : %.2fx\n", time_1thread_opt / avg_time_par);
+        }
+    }
+
+    // Benchmark parallel version (FALSE SHARING) with different thread counts
+    printf("\n--- WITH FALSE SHARING (intentional) ---\n");
+    for (int t = 0; t < num_tests; ++t)
+    {
+        int num_threads = thread_counts[t];
+        if (num_threads > max_threads)
+            break;
+
+        omp_set_num_threads(num_threads);
+
+        double total_time_par_fs = 0.0;
+        for (int i = 0; i < iterations; ++i)
+        {
+            struct AES_ctx ctx;
+            AES_init_ctx_iv(&ctx, key, iv);
+
+            double start = get_time();
+            AES_CTR_xcrypt_buffer_openmp_false_sharing(&ctx, data, size);
+            double end = get_time();
+
+            total_time_par_fs += (end - start);
+        }
+        double avg_time_par_fs = total_time_par_fs / iterations;
+        double throughput_par_fs = (size / (1024.0 * 1024.0)) / avg_time_par_fs;
+
+        char thread_label[64];
+        snprintf(thread_label, sizeof(thread_label), "OpenMP-FS (%d thread%s)",
+                 num_threads, num_threads > 1 ? "s" : "");
+        print_throughput(thread_label, size, avg_time_par_fs);
+
+        // Write parallel result to CSV
+        if (csv_file)
+        {
+            fprintf(csv_file, "%zu,OpenMP-FalseSharing,%d,%lf,%lf\n", size_mb, num_threads, throughput_par_fs, avg_time_par_fs);
+        }
+
+        if (num_threads == 1)
+        {
+            time_1thread_fs = avg_time_par_fs;
+            printf("  Speedup vs sequential      : %.2fx\n", avg_time_seq / avg_time_par_fs);
+        }
+        else
+        {
+            printf("  Speedup vs 1 thread        : %.2fx\n", time_1thread_fs / avg_time_par_fs);
+            printf("  Slowdown vs optimized      : %.2fx (%.1f%% slower)\n",
+                   avg_time_par_fs / (time_1thread_opt * (1.0 / num_threads * time_1thread_opt / avg_time_seq)),
+                   (avg_time_par_fs / (time_1thread_opt * (1.0 / num_threads * time_1thread_opt / avg_time_seq)) - 1.0) * 100.0);
         }
     }
 
