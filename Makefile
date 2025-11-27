@@ -66,6 +66,10 @@ aes_openmp.o : aes_openmp.c aes_openmp.h aes.h
 	echo [CC] $@ $(CFLAGS) $(OMPFLAGS)
 	$(CC) $(CFLAGS) $(OMPFLAGS) -o $@ $<
 
+aes_openmp_nowait.o : aes_openmp_nowait.c aes_openmp_nowait.h aes.h
+	echo [CC] $@ $(CFLAGS) $(OMPFLAGS)
+	$(CC) $(CFLAGS) $(OMPFLAGS) -o $@ $<
+
 aes_openmp_shared_ctx.o : aes_openmp_shared_ctx.c aes_openmp_shared_ctx.h aes.h
 	echo [CC] $@ $(CFLAGS) $(OMPFLAGS)
 	$(CC) $(CFLAGS) $(OMPFLAGS) -o $@ $<
@@ -74,11 +78,11 @@ aes_openmp_false_sharing.o : aes_openmp_false_sharing.c aes_openmp_false_sharing
 	echo [CC] $@ $(CFLAGS) $(OMPFLAGS)
 	$(CC) $(CFLAGS) $(OMPFLAGS) -o $@ $<
 
-benchmark.o : benchmark.c aes.h aes_openmp.h aes_openmp_shared_ctx.h aes_openmp_false_sharing.h
+benchmark.o : benchmark.c aes.h aes_openmp.h aes_openmp_nowait.h aes_openmp_shared_ctx.h aes_openmp_false_sharing.h
 	echo [CC] $@ $(CFLAGS) $(OMPFLAGS)
 	$(CC) $(CFLAGS) $(OMPFLAGS) -o $@ $<
 
-benchmark.elf : aes.o aes_openmp.o aes_openmp_shared_ctx.o aes_openmp_false_sharing.o benchmark.o
+benchmark.elf : aes.o aes_openmp.o aes_openmp_nowait.o aes_openmp_shared_ctx.o aes_openmp_false_sharing.o benchmark.o
 	echo [LD] $@ with OpenMP
 	$(LD) $(LDFLAGS) $(OMPFLAGS) -o $@ $^ -lrt
 

@@ -9,6 +9,7 @@
 #define ECB 1
 #include "aes.h"
 #include "aes_openmp.h"
+#include "aes_openmp_nowait.h"
 #include "aes_openmp_shared_ctx.h"
 #include "aes_openmp_false_sharing.h"
 
@@ -40,13 +41,14 @@ static int test_correctness()
     const size_t test_size = 1024 * 1024; // 1 MB
     uint8_t* data_seq = (uint8_t*)malloc(test_size);
     uint8_t* data_par = (uint8_t*)malloc(test_size);
+    uint8_t* data_par_nowait = (uint8_t*)malloc(test_size);
     uint8_t* data_par_shared = (uint8_t*)malloc(test_size);
     uint8_t* data_par_fs = (uint8_t*)malloc(test_size);
 
     // Initialize with random data
     for (size_t i = 0; i < test_size; ++i)
     {
-        data_seq[i] = data_par[i] = data_par_shared[i] = data_par_fs[i] = rand() & 0xFF;
+        data_seq[i] = data_par[i] = data_par_nowait[i] = data_par_shared[i] = data_par_fs[i] = rand() & 0xFF;
     }
 
     // Setup AES context
@@ -60,9 +62,10 @@ static int test_correctness()
         0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff
     };
 
-    struct AES_ctx ctx_seq, ctx_par, ctx_par_shared, ctx_par_fs;
+    struct AES_ctx ctx_seq, ctx_par, ctx_par_nowait, ctx_par_shared, ctx_par_fs;
     AES_init_ctx_iv(&ctx_seq, key, iv);
     AES_init_ctx_iv(&ctx_par, key, iv);
+    AES_init_ctx_iv(&ctx_par_nowait, key, iv);
     AES_init_ctx_iv(&ctx_par_shared, key, iv);
     AES_init_ctx_iv(&ctx_par_fs, key, iv);
 
@@ -71,6 +74,9 @@ static int test_correctness()
 
     // Encrypt with parallel version (optimized)
     AES_CTR_xcrypt_buffer_openmp(&ctx_par, data_par, test_size);
+
+    // Encrypt with parallel version (nowait)
+    AES_CTR_xcrypt_buffer_openmp_nowait(&ctx_par_nowait, data_par_nowait, test_size);
 
     // Encrypt with parallel version (shared ctx)
     AES_CTR_xcrypt_buffer_openmp_shared_ctx(&ctx_par_shared, data_par_shared, test_size);
@@ -90,6 +96,21 @@ static int test_correctness()
                        i, data_seq[i], data_par[i]);
             }
             errors_par++;
+        }
+    }
+
+    // Compare sequential vs parallel (nowait)
+    int errors_par_nowait = 0;
+    for (size_t i = 0; i < test_size; ++i)
+    {
+        if (data_seq[i] != data_par_nowait[i])
+        {
+            if (errors_par_nowait < 10)
+            {
+                printf("Error (PAR_NOWAIT vs SEQ) at byte %zu: seq=0x%02x, par_nowait=0x%02x\n",
+                       i, data_seq[i], data_par_nowait[i]);
+            }
+            errors_par_nowait++;
         }
     }
 
@@ -125,6 +146,7 @@ static int test_correctness()
 
     free(data_seq);
     free(data_par);
+    free(data_par_nowait);
     free(data_par_shared);
     free(data_par_fs);
 
@@ -137,6 +159,16 @@ static int test_correctness()
     else
     {
         printf("✗ OpenMP (optimized) vs Sequential:     FAILED - Found %d mismatches\n", errors_par);
+        all_passed = 0;
+    }
+
+    if (errors_par_nowait == 0)
+    {
+        printf("✓ OpenMP (nowait) vs Sequential:        PASSED\n");
+    }
+    else
+    {
+        printf("✗ OpenMP (nowait) vs Sequential:        FAILED - Found %d mismatches\n", errors_par_nowait);
         all_passed = 0;
     }
 
@@ -281,6 +313,64 @@ static void benchmark_size(size_t size_mb)
         else
         {
             printf("  Speedup vs 1 thread        : %.2fx\n", time_1thread_opt / avg_time_par);
+        }
+    }
+
+    // Benchmark parallel version (NOWAIT)
+    printf("\n--- NOWAIT (no implicit barrier) ---\n");
+    for (int t = 0; t < num_tests; ++t)
+    {
+        int num_threads = thread_counts[t];
+        if (num_threads > max_threads)
+            break;
+
+        omp_set_num_threads(num_threads);
+
+        double total_time_par_nowait = 0.0;
+        for (int i = 0; i < iterations; ++i)
+        {
+            struct AES_ctx ctx;
+            AES_init_ctx_iv(&ctx, key, iv);
+
+            double start = get_time();
+            AES_CTR_xcrypt_buffer_openmp_nowait(&ctx, data, size);
+            double end = get_time();
+
+            total_time_par_nowait += (end - start);
+        }
+        double avg_time_par_nowait = total_time_par_nowait / iterations;
+        double throughput_par_nowait = (size / (1024.0 * 1024.0)) / avg_time_par_nowait;
+
+        char thread_label[64];
+        snprintf(thread_label, sizeof(thread_label), "OpenMP-Nowait (%d thread%s)",
+                 num_threads, num_threads > 1 ? "s" : "");
+        print_throughput(thread_label, size, avg_time_par_nowait);
+
+        // Write result to CSV
+        if (csv_file)
+        {
+            fprintf(csv_file, "%zu,OpenMP-Nowait,%d,%lf,%lf\n", size_mb, num_threads, throughput_par_nowait, avg_time_par_nowait);
+        }
+
+        if (num_threads == 1)
+        {
+            printf("  Speedup vs sequential      : %.2fx\n", avg_time_seq / avg_time_par_nowait);
+        }
+        else
+        {
+            // Compare to optimized version with same thread count
+            if (t < 16 && opt_times[t] > 0)
+            {
+                double diff_percent = ((avg_time_par_nowait - opt_times[t]) / opt_times[t]) * 100.0;
+                if (avg_time_par_nowait < opt_times[t])
+                {
+                    printf("  vs Optimized (same threads): %.2f%% faster\n", -diff_percent);
+                }
+                else
+                {
+                    printf("  vs Optimized (same threads): %.2f%% slower\n", diff_percent);
+                }
+            }
         }
     }
 
