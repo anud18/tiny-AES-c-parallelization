@@ -9,6 +9,7 @@
 #define ECB 1
 #include "aes.h"
 #include "aes_openmp.h"
+#include "aes_openmp_shared_ctx.h"
 #include "aes_openmp_false_sharing.h"
 
 // CSV output file handle
@@ -39,12 +40,13 @@ static int test_correctness()
     const size_t test_size = 1024 * 1024; // 1 MB
     uint8_t* data_seq = (uint8_t*)malloc(test_size);
     uint8_t* data_par = (uint8_t*)malloc(test_size);
+    uint8_t* data_par_shared = (uint8_t*)malloc(test_size);
     uint8_t* data_par_fs = (uint8_t*)malloc(test_size);
 
     // Initialize with random data
     for (size_t i = 0; i < test_size; ++i)
     {
-        data_seq[i] = data_par[i] = data_par_fs[i] = rand() & 0xFF;
+        data_seq[i] = data_par[i] = data_par_shared[i] = data_par_fs[i] = rand() & 0xFF;
     }
 
     // Setup AES context
@@ -58,9 +60,10 @@ static int test_correctness()
         0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff
     };
 
-    struct AES_ctx ctx_seq, ctx_par, ctx_par_fs;
+    struct AES_ctx ctx_seq, ctx_par, ctx_par_shared, ctx_par_fs;
     AES_init_ctx_iv(&ctx_seq, key, iv);
     AES_init_ctx_iv(&ctx_par, key, iv);
+    AES_init_ctx_iv(&ctx_par_shared, key, iv);
     AES_init_ctx_iv(&ctx_par_fs, key, iv);
 
     // Encrypt with sequential version
@@ -68,6 +71,9 @@ static int test_correctness()
 
     // Encrypt with parallel version (optimized)
     AES_CTR_xcrypt_buffer_openmp(&ctx_par, data_par, test_size);
+
+    // Encrypt with parallel version (shared ctx)
+    AES_CTR_xcrypt_buffer_openmp_shared_ctx(&ctx_par_shared, data_par_shared, test_size);
 
     // Encrypt with parallel version (false sharing)
     AES_CTR_xcrypt_buffer_openmp_false_sharing(&ctx_par_fs, data_par_fs, test_size);
@@ -84,6 +90,21 @@ static int test_correctness()
                        i, data_seq[i], data_par[i]);
             }
             errors_par++;
+        }
+    }
+
+    // Compare sequential vs parallel (shared ctx)
+    int errors_par_shared = 0;
+    for (size_t i = 0; i < test_size; ++i)
+    {
+        if (data_seq[i] != data_par_shared[i])
+        {
+            if (errors_par_shared < 10)
+            {
+                printf("Error (PAR_SHARED vs SEQ) at byte %zu: seq=0x%02x, par_shared=0x%02x\n",
+                       i, data_seq[i], data_par_shared[i]);
+            }
+            errors_par_shared++;
         }
     }
 
@@ -104,6 +125,7 @@ static int test_correctness()
 
     free(data_seq);
     free(data_par);
+    free(data_par_shared);
     free(data_par_fs);
 
     int all_passed = 1;
@@ -115,6 +137,16 @@ static int test_correctness()
     else
     {
         printf("✗ OpenMP (optimized) vs Sequential:     FAILED - Found %d mismatches\n", errors_par);
+        all_passed = 0;
+    }
+
+    if (errors_par_shared == 0)
+    {
+        printf("✓ OpenMP (shared ctx) vs Sequential:    PASSED\n");
+    }
+    else
+    {
+        printf("✗ OpenMP (shared ctx) vs Sequential:    FAILED - Found %d mismatches\n", errors_par_shared);
         all_passed = 0;
     }
 
@@ -193,7 +225,11 @@ static void benchmark_size(size_t size_mb)
     int num_tests = sizeof(thread_counts) / sizeof(thread_counts[0]);
 
     double time_1thread_opt = 0.0;
+    double time_1thread_shared = 0.0;
     double time_1thread_fs = 0.0;
+
+    // Store optimized times for each thread count for comparison
+    double opt_times[16] = {0};
 
     printf("--- OPTIMIZED (no false sharing) ---\n");
     for (int t = 0; t < num_tests; ++t)
@@ -219,6 +255,9 @@ static void benchmark_size(size_t size_mb)
         double avg_time_par = total_time_par / iterations;
         double throughput_par = (size / (1024.0 * 1024.0)) / avg_time_par;
 
+        // Store for comparison
+        opt_times[t] = avg_time_par;
+
         char thread_label[64];
         snprintf(thread_label, sizeof(thread_label), "OpenMP-Opt (%d thread%s)",
                  num_threads, num_threads > 1 ? "s" : "");
@@ -242,6 +281,58 @@ static void benchmark_size(size_t size_mb)
         else
         {
             printf("  Speedup vs 1 thread        : %.2fx\n", time_1thread_opt / avg_time_par);
+        }
+    }
+
+    // Benchmark parallel version (SHARED CTX - read-only cache contention)
+    printf("\n--- SHARED CTX (read-only cache contention) ---\n");
+    for (int t = 0; t < num_tests; ++t)
+    {
+        int num_threads = thread_counts[t];
+        if (num_threads > max_threads)
+            break;
+
+        omp_set_num_threads(num_threads);
+
+        double total_time_par_shared = 0.0;
+        for (int i = 0; i < iterations; ++i)
+        {
+            struct AES_ctx ctx;
+            AES_init_ctx_iv(&ctx, key, iv);
+
+            double start = get_time();
+            AES_CTR_xcrypt_buffer_openmp_shared_ctx(&ctx, data, size);
+            double end = get_time();
+
+            total_time_par_shared += (end - start);
+        }
+        double avg_time_par_shared = total_time_par_shared / iterations;
+        double throughput_par_shared = (size / (1024.0 * 1024.0)) / avg_time_par_shared;
+
+        char thread_label[64];
+        snprintf(thread_label, sizeof(thread_label), "OpenMP-Shared (%d thread%s)",
+                 num_threads, num_threads > 1 ? "s" : "");
+        print_throughput(thread_label, size, avg_time_par_shared);
+
+        // Write parallel result to CSV
+        if (csv_file)
+        {
+            fprintf(csv_file, "%zu,OpenMP-SharedCtx,%d,%lf,%lf\n", size_mb, num_threads, throughput_par_shared, avg_time_par_shared);
+        }
+
+        if (num_threads == 1)
+        {
+            time_1thread_shared = avg_time_par_shared;
+            printf("  Speedup vs sequential      : %.2fx\n", avg_time_seq / avg_time_par_shared);
+        }
+        else
+        {
+            printf("  Speedup vs 1 thread        : %.2fx\n", time_1thread_shared / avg_time_par_shared);
+            // Compare to optimized version with same thread count
+            if (t < 16 && opt_times[t] > 0)
+            {
+                printf("  vs Optimized (same threads): %.2fx slower\n", avg_time_par_shared / opt_times[t]);
+            }
         }
     }
 
