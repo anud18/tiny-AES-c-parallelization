@@ -2,3 +2,5 @@
 /test.elf
 /test.map
 test_package/build
+/benchmark.elf
+/benchmark_results.csv
